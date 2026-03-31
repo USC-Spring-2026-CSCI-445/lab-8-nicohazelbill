@@ -160,7 +160,19 @@ class Map:
 
 # PID controller class
 ######### Your code starts here #########
+class PIDController:
+    def __init__(self, kp: float, ki: float, kd: float):
+        self.kp = kp
+        self.ki = ki
+        self.kd = kd
+        self.prev_error = 0.0
+        self.integral = 0.0
 
+    def compute(self, error: float, dt: float) -> float:
+        self.integral += error * dt
+        derivative = (error - self.prev_error) / dt if dt > 0 else 0.0
+        self.prev_error = error
+        return self.kp * error + self.ki * self.integral + self.kd * derivative
 
 ######### Your code ends here #########
 
@@ -239,12 +251,19 @@ class ParticleFilter:
 
         # Propagate motion of each particle
         ######### Your code starts here #########
+        d = math.sqrt(delta_x**2 + delta_y**2)
+        # Preserve sign for backward motion
+        if d > 0:
+            move_direction = math.atan2(delta_y, delta_x)
+        else:
+            move_direction = 0.0
+
         for p in self._particles:
-            # Apply noisy rotation first
+            # Add Gaussian noise to commanded rotation
             noisy_dtheta = delta_theta + np.random.normal(0, self.rotation_variance)
             p.theta = angle_to_neg_pi_to_pi(p.theta + noisy_dtheta)
 
-            # Then move forward by commanded distance d in particle's heading
+            # Add Gaussian noise to commanded distance, move in particle's heading
             noisy_d = d + np.random.normal(0, self.translation_variance)
             p.x += noisy_d * math.cos(p.theta)
             p.y += noisy_d * math.sin(p.theta)
@@ -262,30 +281,34 @@ class ParticleFilter:
 
         # Calculate posterior probabilities and resample
         ######### Your code starts here #########
-        weights = []
-
         for p in self._particles:
-            # Global angle of the scan beam for this particle
-            global_scan_angle = angle_to_neg_pi_to_pi(p.theta + scan_angle_in_rad)
+            # Global angle of scan beam for this particle
+            global_angle = angle_to_neg_pi_to_pi(p.theta + scan_angle_in_rad)
 
-            # Simulate expected sensor reading at particle's pose
-            z_expected = self.map_.closest_distance((p.x, p.y), global_scan_angle)
+            # Expected distance from the map at particle's pose
+            z_expected = self.map_.closest_distance((p.x, p.y), global_angle)
 
             if z_expected is None:
-                # No wall found — very unlikely location
-                weights.append(1e-300)
+                # No wall found — very unlikely pose
+                p.log_p += math.log(1e-300)
             else:
-                # Gaussian likelihood: how close is expected to actual?
-                w = scipy.stats.norm.pdf(z, loc=z_expected, scale=self.measurement_variance)
-                weights.append(w if w > 0 else 1e-300)
+                # Log-likelihood of actual reading given expected (Gaussian)
+                log_w = scipy.stats.norm(loc=z_expected, scale=self.measurement_variance).logpdf(z)
+                p.log_p += log_w
 
-        # Normalize weights
-        weights = np.array(weights)
+        # Convert log-probabilities to weights using log-sum-exp for stability
+        log_weights = np.array([p.log_p for p in self._particles])
+        log_weights -= np.max(log_weights)  # numerical stability
+        weights = np.exp(log_weights)
         weights /= weights.sum()
 
-        # Resample using numpy weighted choice
-        indices = choice(len(self._particles), size=self.n_particles, replace=True, p=weights)
-        self._particles = [copy.deepcopy(self._particles[i]) for i in indices]
+        # Resample (spec suggests Python's choices())
+        resampled = choice(len(self._particles), size=self.n_particles, replace=True, p=weights)
+        self._particles = [copy.deepcopy(self._particles[i]) for i in resampled]
+
+        # Reset log-probabilities after resampling
+        for p in self._particles:
+            p.log_p = 0.0
 
         self.visualize_particles()
         self.visualize_estimate()
@@ -372,15 +395,23 @@ class Controller:
         marker_array.markers.append(marker)
         self.target_position_pub.publish(marker_array)
 
-    # def take_measurements(self):
+    def take_measurements(self):
         # Take measurement using LIDAR
         ######### Your code starts here #########
         # NOTE: with more than 2 angles the particle filter will converge too quickly, so with high likelihood the
         # correct neighborhood won't be found.
+        scan_indices = [0, 90]  # front and left — only 2 angles to avoid too-fast convergence
+        for idx in scan_indices:
+            if idx < len(self.laserscan.ranges):
+                z = self.laserscan.ranges[idx]
+                if z == inf or z == 0.0:
+                    continue
+                scan_angle_in_rad = math.radians(idx)
+                self._particle_filter.measure(z, scan_angle_in_rad)
 
         ######### Your code ends here #########
 
-    # def autonomous_exploration(self):
+    def autonomous_exploration(self):
         """Randomly explore the environment here, while making sure to call `take_measurements()` and
         `_particle_filter.move_by()`. The particle filter should converge on the robots position eventually.
 
@@ -390,7 +421,59 @@ class Controller:
         """
         # Robot autonomously explores environment while it localizes itself
         ######### Your code starts here #########
+        rate = rospy.Rate(10)
+        pid = PIDController(kp=1.0, ki=0.0, kd=0.1)
+        last_time = time()
 
+        while not rospy.is_shutdown():
+            # Random forward movement
+            forward_dist = uniform(0.3, 0.8)
+            start_x = self.current_position["x"]
+            start_y = self.current_position["y"]
+
+            while not rospy.is_shutdown():
+                traveled = sqrt(
+                    (self.current_position["x"] - start_x)**2 +
+                    (self.current_position["y"] - start_y)**2
+                )
+                if traveled >= forward_dist:
+                    break
+                # Check for obstacles ahead
+                front_range = self.laserscan.ranges[0]
+                if front_range < 0.4 and front_range != 0.0:
+                    break
+                twist = Twist()
+                twist.linear.x = 0.2
+                self.robot_ctrl_pub.publish(twist)
+                rate.sleep()
+
+            self.robot_ctrl_pub.publish(Twist())
+
+            # Update particle filter with motion
+            x, y, theta = self._particle_filter.get_estimate()
+            actual_dist = sqrt(
+                (self.current_position["x"] - start_x)**2 +
+                (self.current_position["y"] - start_y)**2
+            )
+            self._particle_filter.move_by(
+                actual_dist * math.cos(theta),
+                actual_dist * math.sin(theta),
+                0
+            )
+            self.take_measurements()
+
+            # Random turn
+            turn_angle = uniform(-pi, pi)
+            goal_theta = angle_to_neg_pi_to_pi(
+                self.current_position["theta"] + turn_angle
+            )
+            self.rotate_action(goal_theta)
+            self._particle_filter.move_by(0, 0, turn_angle)
+            self.take_measurements()
+
+            self.visualize_position(
+                *self._particle_filter.get_estimate()[:2]
+            )
         ######### Your code ends here #########
 
     def forward_action(self, distance: float):
