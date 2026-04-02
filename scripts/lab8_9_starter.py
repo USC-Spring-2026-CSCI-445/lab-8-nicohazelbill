@@ -255,12 +255,12 @@ class ParticleFilter:
         # Preserve sign for backward motion
 
         for p in self._particles:
-            theta_prime = p.theta + delta_theta + np.random.normal(0, self.rotation_variance)
             d_prime = d + np.random.normal(0, self.translation_variance)
 
-            p.x += d_prime * math.cos(theta_prime)
-            p.y += d_prime * math.sin(theta_prime)
-            p.theta = angle_to_neg_pi_to_pi(theta_prime)
+            p.x += d_prime * math.cos(p.theta)
+            p.y += d_prime * math.sin(p.theta)
+            p.theta += delta_theta + np.random.normal(0,self.rotation_variance)
+            p.theta = angle_to_neg_pi_to_pi(p.theta)
 
         self.visualize_particles()
         ######### Your code ends here #########
@@ -402,13 +402,17 @@ class Controller:
 
     def autonomous_exploration(self):
         rate = rospy.Rate(10)
-        CONFIDENCE_THRESHOLD = 0.3
-        MIN_ACTIONS = 5
+        CONFIDENCE_THRESHOLD = 0.03
+        MIN_ACTIONS = 3
         pid_linear = PIDController(kp=0.5, ki=0.0, kd=0.1)
         pid_angular = PIDController(kp=1.5, ki=0.0, kd=0.1)
         last_time = time()
 
-        actions = ["forward", "forward", "forward", "forward", "left", "forward", "forward", "forward", "right", "right"]
+        actions = ["right", "forward", "left", "forward", "left","forward", "right", "forward", "forward", "forward", "forward", "left", "forward", "forward", "forward"
+                   ,"forward","forward","forward"
+                   
+                   ,"forward", "left", "forward", "forward", "left", "forward", "forward", "forward", "left", "forward", "left", "forward", "left", "forward", "right", "right"]
+        # actions = np.random.choice(["forward","left","right"], size = 100)
         action_idx = 0
 
         while not rospy.is_shutdown():
@@ -564,7 +568,7 @@ if __name__ == "__main__":
         map_aabb = map_["map_aabb"]
 
     map_ = Map(obstacles, map_aabb)
-    num_particles = 300
+    num_particles = 250
     translation_variance = 0.1
     rotation_variance = 0.05
     measurement_variance = 0.1
